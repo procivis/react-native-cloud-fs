@@ -11,11 +11,132 @@
 #import <AssetsLibrary/AssetsLibrary.h>
 #import "RCTLog.h"
 
+@interface RNCloudFsQueryCallback : NSObject
+@property (nonatomic, weak) NSMetadataQuery *query;
+@property (nonatomic, strong) void(^callback)(NSArray *);
+@end
+
+@implementation RNCloudFsQueryCallback
+@end
+
+@interface RNCloudFsFilesListQuery : NSObject
+@property (nonatomic, strong) NSMetadataQuery *queryData;
+@property (nonatomic, strong) NSMutableArray<RNCloudFsQueryCallback *> *queryCallbacks;
+@property (nonatomic, strong) NSFileCoordinator *fileCoordinator;
+@end
+
+@implementation RNCloudFsFilesListQuery
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        self.queryCallbacks = [[NSMutableArray alloc] init];
+        self.fileCoordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+    }
+    return self;
+}
+
+- (void)listFilesAtPath:(NSString *)path callback:(void(^)(NSArray *filesList))callback {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSMetadataQuery *queryData = [[NSMetadataQuery alloc] init];
+        [queryData setSearchScopes:[NSArray arrayWithObject:NSMetadataQueryUbiquitousDocumentsScope]];
+        NSPredicate *pathPredicate1 = [NSPredicate predicateWithFormat: @"%K BEGINSWITH %@", NSMetadataItemPathKey, path];
+        NSPredicate *pathPredicate2 = [NSPredicate predicateWithFormat: @"NOT (%K ENDSWITH %@)", NSMetadataItemPathKey, path];
+        [queryData setPredicate:[NSCompoundPredicate andPredicateWithSubpredicates:@[pathPredicate1, pathPredicate2]]];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(queryDidFinishGathering:)
+                                                     name:NSMetadataQueryDidFinishGatheringNotification
+                                                   object:queryData];
+        [queryData startQuery];
+        self.queryData = queryData;
+        RNCloudFsQueryCallback *queryCallback = [[RNCloudFsQueryCallback alloc] init];
+        queryCallback.query = queryData;
+        queryCallback.callback = callback;
+        [self.queryCallbacks addObject:queryCallback];
+    });
+}
+
+- (void)queryDidFinishGathering:(NSNotification *)notification {
+    NSMetadataQuery *query = [notification object];
+    [query disableUpdates];
+    [query stopQuery];
+    NSDateFormatter *dateFormatter = [[NSDateFormatter alloc] init];
+    [dateFormatter setDateFormat:@"yyyy-MM-dd'T'HH:mm:ssZZZ"];
+    NSMutableArray *filesArray = [[NSMutableArray alloc] init];
+    for (NSMetadataItem *item in [query results]) {
+        NSURL *url = [item valueForAttribute:NSMetadataItemURLKey];
+        if (!url) {
+            continue;
+        }
+        NSString *fileName = [url.absoluteString lastPathComponent];
+        NSError *error = nil;
+        __block NSDictionary *attributes;
+        [self.fileCoordinator coordinateReadingItemAtURL:url
+                                                 options:NSFileCoordinatorReadingImmediatelyAvailableMetadataOnly
+                                                   error:&error
+                                              byAccessor:^(NSURL * _Nonnull newURL) {
+            NSError *error;
+            attributes = [url promisedItemResourceValuesForKeys:@[NSURLContentModificationDateKey, NSURLFileSizeKey, NSURLUbiquitousItemIsDownloadedKey, NSURLIsDirectoryKey, NSURLIsRegularFileKey] error:&error];
+        }];
+
+        if (!attributes) {
+            continue;
+        }
+        [filesArray addObject:@{
+            @"path": url.path,
+            @"name": fileName,
+            @"size": attributes[NSURLFileSizeKey],
+            @"lastModified": [dateFormatter stringFromDate:attributes[NSURLContentModificationDateKey]],
+            @"isDirectory": attributes[NSURLIsDirectoryKey],
+            @"isFile": attributes[NSURLIsRegularFileKey],
+            @"isDownloaded": attributes[NSURLUbiquitousItemIsDownloadedKey],
+        }];
+    }
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:NSMetadataQueryDidFinishGatheringNotification object:query];
+    RNCloudFsQueryCallback *queryCallback;
+    for (RNCloudFsQueryCallback *callback in self.queryCallbacks) {
+        if (![callback.query isEqual:query]) {
+            continue;
+        }
+        queryCallback = callback;
+        break;
+    }
+    if (queryCallback) {
+        [self.queryCallbacks removeObject:queryCallback];
+        queryCallback.callback(filesArray);
+    }
+    NSLog(@"%@", filesArray);
+    self.queryData = nil;
+}
+
+@end
+
+@interface RNCloudFs ()
+
+@property (nonatomic, strong) RNCloudFsFilesListQuery *filesListQuery;
+@property (nonatomic, strong) NSFileCoordinator *fileCoordinator;
+
+@end
+
+
 @implementation RNCloudFs
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        self.filesListQuery = [[RNCloudFsFilesListQuery alloc] init];
+        self.fileCoordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+    }
+    return self;
+}
 
 - (dispatch_queue_t)methodQueue
 {
     return dispatch_queue_create("RNCloudFs.queue", DISPATCH_QUEUE_SERIAL);
+}
+
++ (BOOL)requiresMainQueueSetup {
+    return NO;
 }
 
 RCT_EXPORT_MODULE()
@@ -70,7 +191,6 @@ RCT_EXPORT_METHOD(fileExists:(NSDictionary *)options
 RCT_EXPORT_METHOD(listFiles:(NSDictionary *)options
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
-
     NSString *destinationPath = [options objectForKey:@"targetPath"];
     NSString *scope = [options objectForKey:@"scope"];
     bool documentsFolder = !scope || [scope caseInsensitiveCompare:@"visible"] == NSOrderedSame;
@@ -83,77 +203,44 @@ RCT_EXPORT_METHOD(listFiles:(NSDictionary *)options
     NSURL *ubiquityURL = documentsFolder ? [self icloudDocumentsDirectory] : [self icloudDirectory];
 
     if (ubiquityURL) {
-        NSURL* target = [ubiquityURL URLByAppendingPathComponent:destinationPath];
+        NSURL *target = [ubiquityURL URLByAppendingPathComponent:destinationPath];
 
-        NSMutableArray<NSDictionary *> *fileData = [NSMutableArray new];
-
-        NSError *error = nil;
-
-        BOOL isDirectory;
-        [fileManager fileExistsAtPath:[target path] isDirectory:&isDirectory];
-
-        NSURL *dirPath;
-        NSArray *contents;
-        if(isDirectory) {
-            contents = [fileManager contentsOfDirectoryAtPath:[target path] error:&error];
-            dirPath = target;
-        } else {
-            contents = @[[target lastPathComponent]];
-            dirPath = [target URLByDeletingLastPathComponent];
-        }
-
-        if(error) {
-            return reject(@"error", error.description, nil);
-        }
-
-        [contents enumerateObjectsUsingBlock:^(id object, NSUInteger idx, BOOL *stop) {
-            NSURL *fileUrl = [dirPath URLByAppendingPathComponent:object];
-
-            NSError *error;
-            NSDictionary *attributes = [fileManager attributesOfItemAtPath:[fileUrl path] error:&error];
-            if(error) {
-                RCTLogTrace(@"problem getting attributes for %@", [fileUrl path]);
-                //skip this one
-                return;
-            }
-
-            NSFileAttributeType type = [attributes objectForKey:NSFileType];
-
-            bool isDir = type == NSFileTypeDirectory;
-            bool isFile = type == NSFileTypeRegular;
-
-            if(!isDir && !isFile)
-                return;
-
-            NSDate* modDate = [attributes objectForKey:NSFileModificationDate];
-
-            NSURL *shareUrl = [fileManager URLForPublishingUbiquitousItemAtURL:fileUrl expirationDate:nil error:&error];
-
-            [fileData addObject:@{
-                                  @"name": object,
-                                  @"path": [fileUrl path],
-                                  @"uri": shareUrl ? [shareUrl absoluteString] : [NSNull null],
-                                  @"size": [attributes objectForKey:NSFileSize],
-                                  @"lastModified": [dateFormatter stringFromDate:modDate],
-                                  @"isDirectory": @(isDir),
-                                  @"isFile": @(isFile)
-                                  }];
+        [self.filesListQuery listFilesAtPath:target.path callback:^(NSArray *filesList) {
+            return resolve(@{ @"files": filesList });
         }];
-
-        if (error) {
-            return reject(@"error", [NSString stringWithFormat:@"could not copy to iCloud drive '%@'", destinationPath], error);
-        }
-
-        NSString *relativePath = [[dirPath path] stringByReplacingOccurrencesOfString:[ubiquityURL path] withString:@"."];
-
-        return resolve(@{
-                         @"files": fileData,
-                         @"path": relativePath
-                         });
-
+        return;
     } else {
         NSLog(@"Could not retrieve a ubiquityURL");
         return reject(@"error", [NSString stringWithFormat:@"could not copy to iCloud drive '%@'", destinationPath], nil);
+    }
+}
+
+RCT_EXPORT_METHOD(downloadFile:(NSDictionary *)options
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject) {
+    NSURL *url = [NSURL fileURLWithPath:[options objectForKey:@"targetPath"]];
+    NSError *error = nil;
+    BOOL success = [[NSFileManager defaultManager] startDownloadingUbiquitousItemAtURL:url error:&error];
+    if (!success) {
+        NSLog(@"failed to start download");
+        return reject(@"error", @"Failed to start download", nil);
+    } else {
+        NSDictionary *attrs = [url resourceValuesForKeys:@[NSURLUbiquitousItemIsDownloadedKey] error:&error];
+        NSLog(@"%@ attributes: %@", url.lastPathComponent, attrs);
+        if (attrs != nil) {
+            if ([[attrs objectForKey:NSURLUbiquitousItemIsDownloadedKey] boolValue]) {
+                NSLog(@"File already downloaded");
+                return resolve(@{});
+            } else {
+                NSError *error2 = nil;
+                [self.fileCoordinator coordinateReadingItemAtURL:url options:0 error:&error2 byAccessor:^(NSURL * _Nonnull newURL) {
+                    NSLog(@"File downloaded: %@", newURL.lastPathComponent);
+                    return resolve(@{});
+                }];
+            }
+        } else {
+            return reject(@"error", @"File already downloaded", nil);
+        }
     }
 }
 
