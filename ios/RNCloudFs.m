@@ -36,10 +36,11 @@
     return self;
 }
 
-- (void)listFilesAtPath:(NSString *)path callback:(void(^)(NSArray *filesList))callback {
+- (void)listFilesAtPath:(NSString *)path documentsFolder:(BOOL)documentsFolder callback:(void(^)(NSArray *filesList))callback {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMetadataQuery *queryData = [[NSMetadataQuery alloc] init];
-        [queryData setSearchScopes:[NSArray arrayWithObject:NSMetadataQueryUbiquitousDocumentsScope]];
+        NSString *scope = documentsFolder ? NSMetadataQueryUbiquitousDocumentsScope : NSMetadataQueryUbiquitousDataScope;
+        [queryData setSearchScopes:[NSArray arrayWithObject:scope]];
         NSPredicate *pathPredicate1 = [NSPredicate predicateWithFormat: @"%K BEGINSWITH %@", NSMetadataItemPathKey, path];
         NSPredicate *pathPredicate2 = [NSPredicate predicateWithFormat: @"NOT (%K ENDSWITH %@)", NSMetadataItemPathKey, path];
         [queryData setPredicate:[NSCompoundPredicate andPredicateWithSubpredicates:@[pathPredicate1, pathPredicate2]]];
@@ -68,7 +69,7 @@
         if (!url) {
             continue;
         }
-        NSString *fileName = [url.absoluteString lastPathComponent];
+        NSString *fileName = [url.path lastPathComponent];
         NSError *error = nil;
         __block NSDictionary *attributes;
         [self.fileCoordinator coordinateReadingItemAtURL:url
@@ -85,7 +86,7 @@
         [filesArray addObject:@{
             @"path": url.path,
             @"name": fileName,
-            @"size": attributes[NSURLFileSizeKey],
+            @"size": attributes[NSURLFileSizeKey] ? attributes[NSURLFileSizeKey] : @0,
             @"lastModified": [dateFormatter stringFromDate:attributes[NSURLContentModificationDateKey]],
             @"isDirectory": attributes[NSURLIsDirectoryKey],
             @"isFile": attributes[NSURLIsRegularFileKey],
@@ -205,7 +206,7 @@ RCT_EXPORT_METHOD(listFiles:(NSDictionary *)options
     if (ubiquityURL) {
         NSURL *target = [ubiquityURL URLByAppendingPathComponent:destinationPath];
 
-        [self.filesListQuery listFilesAtPath:target.path callback:^(NSArray *filesList) {
+        [self.filesListQuery listFilesAtPath:target.path documentsFolder:documentsFolder callback:^(NSArray *filesList) {
             return resolve(@{ @"files": filesList });
         }];
         return;
